@@ -81,12 +81,20 @@ async def attach_tool_to_assistant(assistant_id: str, tool_id: str, current_mode
     existing_tool_ids = current_model.get("toolIds", [])
     if tool_id not in existing_tool_ids:
         existing_tool_ids.append(tool_id)
+    from .config import BACKEND_URL, VAPI_SECRET
+    clean_backend_url = BACKEND_URL.rstrip('/') if BACKEND_URL else "https://test6.fireai.agency"
+
     patch_payload = {
         "model": {
-            "provider": current_model.get("provider", "openai"),
-            "model": current_model.get("model", "gpt-4o-mini"),
+            "provider": "custom-llm",
+            "model": "gpt-4o",
+            "url": f"{clean_backend_url}/api/chat/completions",
             "messages": current_model.get("messages", []),
-            "toolIds": existing_tool_ids
+            "toolIds": existing_tool_ids,
+            "temperature": 0.3,
+            "headers": {
+                "x-vapi-secret": VAPI_SECRET
+            }
         }
     }
     async with httpx.AsyncClient(timeout=20) as client:
@@ -209,4 +217,4 @@ async def create_order_tool(tool_name: str = "save_order", language: str = "en")
         response = await client.post(f"{VAPI_BASE}/tool", json=payload, headers=vapi_headers())
     if response.status_code not in (200, 201):
         raise Exception(f"Order tool creation failed: {response.text}")
-    return response.json()["id"]
+    return response.json()["id"]

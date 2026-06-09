@@ -3,13 +3,13 @@ import logging
 from datetime import datetime
 from fastapi import APIRouter, File, UploadFile, Form, HTTPException, Depends
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, List
 from sqlalchemy.orm import Session
 import httpx
 import os
 from app.database import get_db, Assistant, KnowledgeBase
 from app.auth import get_current_user
-from app.config import PIZZERIA_SYSTEM_PROMPT, VAPI_BASE, BACKEND_URL
+from app.config import PIZZERIA_SYSTEM_PROMPT, VAPI_BASE, BACKEND_URL, VAPI_SECRET
 from app.vapi_client import upload_file_to_vapi, create_query_tool, attach_tool_to_assistant, vapi_headers, delete_file_from_vapi, create_order_tool
 from app.file_utils import extract_text_from_bytes
 
@@ -23,7 +23,7 @@ async def create_assistant(
     voice_id: str = Form("Hp07ONf6C5qlCKOeB4oo"),
     system_prompt: str = Form(None),
     language: str = Form("da"),
-    files: list[UploadFile] = File(None),
+    files: Optional[List[UploadFile]] = File(None),
 
     db: Session = Depends(get_db),
     user = Depends(get_current_user)
@@ -79,98 +79,87 @@ async def create_assistant(
         used_prompt = base_prompt
 
 
-    # Determine TTS provider — Flash v2.5 for 11labs (fastest), native for Vapi voices
-    vapi_voices = ["Elliot", "Savannah", "Rohan", "Emma", "Clara", "Nico", "Kai", "Sagar"]
-    provider = "vapi" if voice_id in vapi_voices else "11labs"
-
-    keywords = []
-    # Core menu & ordering terms
-    keywords.extend(["skinke", "løg", "ananas", "champignon", "hvidløg", "dressing", "sodavand", "levering", "afhentning", "størrelse", "pizza", "pepperoni", "margherita", "oksekød", "kylling", "bacon"])
-    keywords.extend(["burger", "cheeseburger", "nuggets", "cola", "coke", "frites", "pommes", "tun", "tunsalat", "pastakylling", "kebab", "bbq"])
-    # Critical terms found miscatched in transcripts (vand→fragment, shawarma→hallucination, oksekød→Mørket)
-    keywords.extend(["vand", "shawarma", "salatpizza", "agurk", "tomat", "stor", "lille", "mellem", "ekstra", "vegetar", "bolognese", "fiskefilet", "snackbox", "pastrami", "avocado", "jalapeno", "paprika", "mozzarella", "truffle", "diavola", "mascarpone", "barbecue"])
-    # Short yes/no affirmations
-    keywords.extend(["ja", "jo", "jep", "nej", "ellers tak"])
-    
-    if extracted_texts:
-        import re
-        for text in extracted_texts:
-            # Include Danish characters æ, ø, å
-            found = re.findall(r'[a-zA-ZæøåÆØÅ]+', text)
-            keywords.extend([k.lower() for k in found if len(k) > 3])
-    
-    # Final cleanup: lowercase, alpha only, unique. Boost weight :4 (up from :2) for critical Danish terms
-    unique_keywords = sorted(list(set(keywords)))
-    unique_keywords = [k for k in unique_keywords if k.isalpha()]
-    boosted_keywords = [f"{k}:4" for k in unique_keywords]
-    print(f"CLEANED KEYWORDS ({len(unique_keywords)}): {unique_keywords}")
-
-    # Determine Transcriber based on name
-    use_elevenlabs_stt = "11labs" in assistant_name.lower() or "elevenlabs" in assistant_name.lower()
-    if use_elevenlabs_stt:
-        transcriber_config = {
-            "provider": "11labs",
-            "model": "scribe_v2_realtime",
-            "language": "da"
+    transcriber_config = {
+        "model": "default",
+        "language": "da",
+        "provider": "speechmatics",
+        "fallbackPlan": {
+            "transcribers": [
+                {
+                    "model": "nova-3-general",
+                    "language": "da-DK",
+                    "numerals": False,
+                    "provider": "deepgram",
+                    "confidenceThreshold": 0.4
+                }
+            ]
         }
+    }
+
+    voice_config = {
+        "model": "sonic-3.5",
+        "voiceId": "a466f9e2-28eb-4bb7-925c-8e8984950700",
+        "provider": "cartesia",
+        "language": "da"
+    }
+
+    model = "gpt-4o"
+    llm_provider = "openai"
+
+    if BACKEND_URL:
+        clean_backend_url = BACKEND_URL.rstrip('/')
     else:
-        transcriber_config = {
-            "provider": "deepgram",
-            "model": "nova-3",
-            "language": "da",
-            "keywords": boosted_keywords,
-            "smartFormat": True,
-            "endpointing": 500  # Vapi max is 500ms
-        }
-
-
-    # Build voice config — Multilingual v2 for Native Danish, Flash v2.5 for English speed
-    voice_config = {"provider": provider, "voiceId": voice_id, "speed": 1.1, "stability": 0.5, "similarityBoost": 0.8}
-    if provider == "11labs":
-        voice_config["model"] = "eleven_flash_v2_5"
-
-
-    # Enforce Gemini models
-    if not model.startswith("gemini-"):
-        model = "gemini-2.5-flash"
-    llm_provider = "google"
-
-
+        clean_backend_url = "https://test6.fireai.agency" # Fallback to known backend
 
     assistant_payload = {
         "name": assistant_name,
         "transcriber": transcriber_config,
         "model": {
-            "provider": llm_provider,
+            "provider": "custom-llm",
             "model": model,
+            "url": f"{clean_backend_url}/api/chat/completions",
             "messages": [{"role": "system", "content": used_prompt}],
-            "temperature": 0.3 
+            "temperature": 0.3,
+            "headers": {
+                "x-vapi-secret": VAPI_SECRET
+            }
         },
         "voice": voice_config,
-        "startSpeakingPlan": {
-            "waitSeconds": 0.7,  # Increased to prevent agent from dropping the first sentence
-            "smartEndpointingEnabled": True
-        },
-        # Professional Interruption: stops on "Nej vent" (2 words).
-        "stopSpeakingPlan": {
-            "numWords": 2,
-            "voiceSeconds": 0.3,
-            "backoffSeconds": 1.0
-        },
-        "backchannelingEnabled": False,
-
-        "silenceTimeoutSeconds": 30,  # Call hangup safety valve — NOT related to turn-taking latency
-
-        "firstMessage": "Velkommen til Pizzeria Network! Hvad kan jeg hjælpe dig med i dag?",
-        "endCallMessage": "Tak for dit opkald, have en god dag!",
         "recordingEnabled": True,
+        "firstMessage": "Velkommen til FoodVoice punktum A I! Hvad kan jeg hjælpe dig med i dag?",
+        "endCallMessage": "Tak for dit opkald, have en god dag!",
+        "silenceTimeoutSeconds": 30,
         "maxDurationSeconds": 600,
+        "backchannelingEnabled": False,
+        "backgroundDenoisingEnabled": True,
+        "startSpeakingPlan": {
+            "waitSeconds": 0.1,
+            "smartEndpointingEnabled": True,
+            "smartEndpointingPlan": {
+                "provider": "vapi"
+            },
+            "transcriptionEndpointingPlan": {
+                "onNumberSeconds": 0.2,
+                "onPunctuationSeconds": 0.1,
+                "onNoPunctuationSeconds": 0.3
+            }
+        },
+        "stopSpeakingPlan": {
+            "numWords": 0,
+            "voiceSeconds": 0.3,
+            "backoffSeconds": 0.6
+        }
     }
 
 
 
     if BACKEND_URL:
-        assistant_payload["serverUrl"] = f"{BACKEND_URL}/api/webhook/call"
+        clean_backend_url = BACKEND_URL.rstrip('/')
+        assistant_payload["serverUrl"] = f"{clean_backend_url}/api/webhook/call"
+        assistant_payload["server"] = {
+            "url": f"{clean_backend_url}/api/webhook/call",
+            "timeoutSeconds": 20
+        }
 
     async with httpx.AsyncClient(timeout=30) as client:
         resp = await client.post(f"{VAPI_BASE}/assistant", json=assistant_payload, headers=vapi_headers())
@@ -241,35 +230,13 @@ def get_assistants(db: Session = Depends(get_db), user=Depends(get_current_user)
 @router.get("/api/vapi-voices")
 async def get_vapi_voices(user=Depends(get_current_user)):
     """Fetch voices from Vapi API (configured voices in the user's account)."""
-    # We always want Constantin Birkedal to be available as he is the requested default
-    constantin = {"id": "Hp07ONf6C5qlCKOeB4oo", "name": "Constantin Birkedal", "provider": "11labs"}
-    
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.get(f"{VAPI_BASE}/voice", headers=vapi_headers())
-        voices = []
-        if resp.status_code == 200:
-            voices = resp.json()
-        
-        # If the response is empty or failed, use a curated fallback with native options
-        if not voices:
-            voices = [
-                {"id": "jsCqWAovK2LkecY7zXl4", "name": "Freja (Native Danish)", "provider": "11labs"},
-                {"id": "CJVigY5qzO86Hvf0ASMj", "name": "Erik (Native Danish)", "provider": "11labs"},
-                {"id": "IKne3meq5aSn9XLyUdCD", "name": "Charlie (English)", "provider": "11labs"},
-                {"id": "21m00Tcm4TlvDq8ikWAM", "name": "Rachel (English)", "provider": "11labs"},
-                {"id": "Elliot", "name": "Elliot (Vapi)", "provider": "vapi"}
-            ]
-            
-        # Ensure Constantin Birkedal is present and at the top
-        # Check if he's already in the list (by ID)
-        if not any(v.get('id') == constantin['id'] or v.get('voiceId') == constantin['id'] for v in voices):
-            voices.insert(0, constantin)
-            
-        return voices
-    except Exception as e:
-        logger.error(f"Error fetching Vapi voices: {e}")
-        return [constantin]
+    """Return the hardcoded Cartesia voice to ensure only the specified voice can be selected."""
+    cartesia_voice = {
+        "id": "a466f9e2-28eb-4bb7-925c-8e8984950700",
+        "name": "Cartesia Sonic 3.5 (Danish)",
+        "provider": "cartesia"
+    }
+    return [cartesia_voice]
 
 @router.get("/api/assistant/{assistant_id}")
 async def get_assistant_detail(assistant_id: str, db: Session = Depends(get_db), user=Depends(get_current_user)):
@@ -313,7 +280,7 @@ def get_knowledge(assistant_id: str, db: Session = Depends(get_db), user=Depends
 @router.post("/api/assistant/{assistant_id}/add-files")
 async def add_files_to_assistant(
     assistant_id: str,
-    files: list[UploadFile] = File(...),
+    files: List[UploadFile] = File(...),
     db: Session = Depends(get_db),
     user=Depends(get_current_user)
 ):
@@ -381,15 +348,26 @@ async def add_files_to_assistant(
                 except: pass
                 assistant.query_tool_id = None
             
+            clean_backend_url = BACKEND_URL.rstrip('/') if BACKEND_URL else "https://test6.fireai.agency"
             patch_payload = {
                 "model": {
-                    "provider": current_model.get("provider", "google"),
-                    "model": current_model.get("model", "gemini-2.0-flash"),
+                    "provider": "custom-llm",
+                    "model": "gpt-4o",
+                    "url": f"{clean_backend_url}/api/chat/completions",
                     "messages": updated_messages,
                     "toolIds": toolIds,
-                    "temperature": 0.3
+                    "temperature": 0.3,
+                    "headers": {
+                        "x-vapi-secret": VAPI_SECRET
+                    }
                 }
             }
+            if BACKEND_URL:
+                patch_payload["serverUrl"] = f"{clean_backend_url}/api/webhook/call"
+                patch_payload["server"] = {
+                    "url": f"{clean_backend_url}/api/webhook/call",
+                    "timeoutSeconds": 20
+                }
             assistant.system_prompt = new_prompt
             await client.patch(f"{VAPI_BASE}/assistant/{assistant_id}", json=patch_payload, headers=vapi_headers())
 
@@ -465,43 +443,57 @@ async def update_assistant(assistant_id: str, data: UpdateAssistant, db: Session
         messages = current_model.get("messages", [])
         updated_messages = [m for m in messages if m.get("role") != "system"]
         updated_messages.insert(0, {"role": "system", "content": data.system_prompt})
+        clean_backend_url = BACKEND_URL.rstrip('/') if BACKEND_URL else "https://test6.fireai.agency"
         patch_payload["model"] = {
-            "provider": current_model.get("provider", "openai"),
-            "model": current_model.get("model", "gpt-4o-mini"),
+            "provider": "custom-llm",
+            "model": "gpt-4o",
+            "url": f"{clean_backend_url}/api/chat/completions",
             "messages": updated_messages,
             "toolIds": current_model.get("toolIds", []),
-            "temperature": 0.3
+            "temperature": 0.3,
+            "headers": {
+                "x-vapi-secret": VAPI_SECRET
+            }
         }
         assistant.system_prompt = data.system_prompt
 
     if data.model is not None:
+        assistant.model = "gpt-4o"
         if "model" not in patch_payload:
+            clean_backend_url = BACKEND_URL.rstrip('/') if BACKEND_URL else "https://test6.fireai.agency"
             patch_payload["model"] = {
-                "provider": current_model.get("provider", "openai"),
-                "model": data.model,
+                "provider": "custom-llm",
+                "model": "gpt-4o",
+                "url": f"{clean_backend_url}/api/chat/completions",
                 "messages": current_model.get("messages", []),
                 "toolIds": current_model.get("toolIds", []),
-                "temperature": 0.3
+                "temperature": 0.3,
+                "headers": {
+                    "x-vapi-secret": VAPI_SECRET
+                }
             }
-        else:
-            patch_payload["model"]["model"] = data.model
-        assistant.model = data.model
 
     if data.voice_id is not None:
-        vapi_voices = ["Elliot", "Savannah", "Rohan", "Emma", "Clara", "Nico", "Kai", "Sagar"]
-        provider = "vapi" if data.voice_id in vapi_voices else "11labs"
-        voice_patch = {"provider": provider, "voiceId": data.voice_id, "speed": 1.1, "stability": 0.5, "similarityBoost": 0.8}
-        if provider == "11labs":
-            target_lang = data.language if data.language is not None else assistant.language
-            voice_patch["model"] = "eleven_flash_v2_5"
-        patch_payload["voice"] = voice_patch
-        assistant.voice_id = data.voice_id
+        patch_payload["voice"] = {
+            "model": "sonic-3.5",
+            "voiceId": "a466f9e2-28eb-4bb7-925c-8e8984950700",
+            "provider": "cartesia",
+            "language": "da"
+        }
+        assistant.voice_id = "a466f9e2-28eb-4bb7-925c-8e8984950700"
 
     if data.language is not None:
         assistant.language = "da"
 
 
     if patch_payload:
+        if BACKEND_URL:
+            clean_backend_url = BACKEND_URL.rstrip('/')
+            patch_payload["serverUrl"] = f"{clean_backend_url}/api/webhook/call"
+            patch_payload["server"] = {
+                "url": f"{clean_backend_url}/api/webhook/call",
+                "timeoutSeconds": 20
+            }
         async with httpx.AsyncClient(timeout=20) as client:
             resp = await client.patch(f"{VAPI_BASE}/assistant/{assistant.id}", json=patch_payload, headers=vapi_headers())
         if resp.status_code not in (200, 201) and resp.status_code != 204:
@@ -644,6 +636,9 @@ async def fix_all_assistants_prompt(db: Session = Depends(get_db)):
                 if k.extracted_text:
                     kb_map[k.assistant_id].append(k.extracted_text)
 
+            # Cache tool creation/update to avoid hitting Vapi rate limits in the loop
+            order_tool_cache = {}
+            import asyncio
 
             for va in vapi_assistants:
                 assistant_id  = va.get("id")
@@ -655,7 +650,11 @@ async def fix_all_assistants_prompt(db: Session = Depends(get_db)):
                 extracted_texts = kb_map.get(assistant_id, [])
 
                 # Ensure order tool is fresh and correct for this language
-                order_tool_id = await create_order_tool(language=va_lang)
+                if va_lang not in order_tool_cache:
+                    order_tool_cache[va_lang] = await create_order_tool(language=va_lang)
+                    # Small delay to respect Vapi's API rate limits
+                    await asyncio.sleep(1)
+                order_tool_id = order_tool_cache[va_lang]
 
                 # Load correct prompt
                 p_file = "system_prompt.txt"
@@ -681,74 +680,77 @@ async def fix_all_assistants_prompt(db: Session = Depends(get_db)):
                 messages = [m for m in current_model.get("messages", []) if m.get("role") != "system"]
                 messages.insert(0, {"role": "system", "content": final_prompt})
 
-                # Generate keywords for this assistant
-                current_keywords = ["pizza", "pepperoni", "margherita", "oksekød", "kylling", "bacon"]
-                current_keywords.extend(["skinke", "løg", "ananas", "champignon", "hvidløg", "dressing", "sodavand", "levering", "afhentning", "størrelse"])
-                current_keywords.extend(["burger", "cheeseburger", "nuggets", "cola", "coke", "frites", "pommes", "tun", "tunsalat", "pastakylling", "kebab", "bbq"])
-                # Expanded seed for existing assistants
-                current_keywords.extend(["vand", "shawarma", "salatpizza", "agurk", "tomat", "stor", "lille", "mellem", "ekstra", "vegetar", "bolognese", "fiskefilet", "snackbox", "pastrami", "avocado", "jalapeno", "paprika", "mozzarella", "truffle", "diavola", "mascarpone", "barbecue"])
-                # Short yes/no affirmations
-                current_keywords.extend(["ja", "jo", "jep", "nej", "ellers tak"])
-                
-                if extracted_texts:
-                    import re
-                    for text in extracted_texts:
-                        found = re.findall(r'[a-zA-ZæøåÆØÅ]+', text)
-                        current_keywords.extend([k.lower() for k in found if len(k) > 3])
-                
-                unique_kw = sorted(list(set(current_keywords)))
-                unique_kw = [k for k in unique_kw if k.isalpha()]
-                boosted_keywords = [f"{k}:4" for k in unique_kw]
-
-                current_voice = va.get("voice", {})
-                current_voice["speed"] = 1.1
-                if current_voice.get("provider") == "11labs":
-                    current_voice["stability"] = 0.5
-                    current_voice["similarityBoost"] = 0.8
-                    current_voice["model"] = "eleven_flash_v2_5"
-
-                # Determine Transcriber based on name
-                assistant_name = va.get("name", "")
-                use_elevenlabs_stt = "11labs" in assistant_name.lower() or "elevenlabs" in assistant_name.lower()
-                if use_elevenlabs_stt:
-                    transcriber_config = {
-                        "provider": "11labs",
-                        "model": "scribe_v2_realtime",
-                        "language": "da"
+                transcriber_config = {
+                    "model": "default",
+                    "language": "da",
+                    "provider": "speechmatics",
+                    "fallbackPlan": {
+                        "transcribers": [
+                            {
+                                "model": "nova-3-general",
+                                "language": "da-DK",
+                                "numerals": False,
+                                "provider": "deepgram",
+                                "confidenceThreshold": 0.4
+                            }
+                        ]
                     }
-                else:
-                    transcriber_config = {
-                        "provider": "deepgram",
-                        "model": "nova-3",
-                        "language": "da",
-                        "keywords": boosted_keywords,
-                        "smartFormat": True,
-                        "endpointing": 500
-                    }
+                }
 
+                current_voice = {
+                    "model": "sonic-3.5",
+                    "voiceId": "a466f9e2-28eb-4bb7-925c-8e8984950700",
+                    "provider": "cartesia",
+                    "language": "da"
+                }
+
+                clean_backend_url = BACKEND_URL.rstrip('/') if BACKEND_URL else "https://test6.fireai.agency"
                 patch_payload = {
                     "model": {
-                        "provider": current_model.get("provider", "google"),
-                        "model": current_model.get("model", "gemini-2.0-flash"),
+                        "provider": "custom-llm",
+                        "model": "gpt-4o",
+                        "url": f"{clean_backend_url}/api/chat/completions",
                         "messages": [{"role": "system", "content": final_prompt}],
                         "toolIds": list(set(current_model.get("toolIds", []) + [order_tool_id])),
-                        "temperature": 0.3
+                        "temperature": 0.3,
+                        "headers": {
+                            "x-vapi-secret": VAPI_SECRET
+                        }
                     },
                     "transcriber": transcriber_config,
-                    "firstMessage": "Velkommen til Pizzeria Network! Hvad kan jeg hjælpe dig med?",
+                    "recordingEnabled": True,
+                    "firstMessage": "Velkommen til FoodVoice punktum A I! Hvad kan jeg hjælpe dig med i dag?",
+                    "endCallMessage": "Tak for dit opkald, have en god dag!",
+                    "silenceTimeoutSeconds": 30,
+                    "maxDurationSeconds": 600,
+                    "backchannelingEnabled": False,
+                    "backgroundDenoisingEnabled": True,
                     "startSpeakingPlan": {
-                        "waitSeconds": 0.7,
-                        "smartEndpointingEnabled": True
+                        "waitSeconds": 0.1,
+                        "smartEndpointingEnabled": True,
+                        "smartEndpointingPlan": {
+                            "provider": "vapi"
+                        },
+                        "transcriptionEndpointingPlan": {
+                            "onNumberSeconds": 0.2,
+                            "onPunctuationSeconds": 0.1,
+                            "onNoPunctuationSeconds": 0.3
+                        }
                     },
                     "stopSpeakingPlan": {
-                        "numWords": 2,
+                        "numWords": 0,
                         "voiceSeconds": 0.3,
-                        "backoffSeconds": 1.0
+                        "backoffSeconds": 0.6
                     },
-                    "backchannelingEnabled": False,
                     "voice": current_voice
                 }
 
+                if BACKEND_URL:
+                    patch_payload["serverUrl"] = f"{clean_backend_url}/api/webhook/call"
+                    patch_payload["server"] = {
+                        "url": f"{clean_backend_url}/api/webhook/call",
+                        "timeoutSeconds": 20
+                    }
 
                 resp = await client.patch(
                     f"{VAPI_BASE}/assistant/{assistant_id}",
@@ -767,6 +769,9 @@ async def fix_all_assistants_prompt(db: Session = Depends(get_db)):
                 else:
                     failed.append({"id": assistant_id, "error": resp.text})
                     logger.warning(f"Failed to update assistant {assistant_id}: {resp.text}")
+
+                # Introduce a small sleep to avoid hitting Vapi's API rate limits for assistant patch requests
+                await asyncio.sleep(1)
 
         db.commit()
         return {

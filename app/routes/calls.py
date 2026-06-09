@@ -57,6 +57,19 @@ async def call_webhook(request: Request, db: Session = Depends(get_db)):
 
         logger.info(f"[VAPI WEBHOOK] CallID: {call_id}, Event: {event}")
 
+        # Pre-warm cache the moment the call goes live
+        status = message.get("status") or data.get("status")
+        if event == "status-update" and status == "in-progress":
+            assistant_obj = message.get("assistant") or data.get("assistant") or {}
+            system_msgs = assistant_obj.get("model", {}).get("messages", [])
+            system_content = next(
+                (m["content"] for m in system_msgs if isinstance(m, dict) and m.get("role") == "system"), None
+            )
+            if system_content:
+                from app.routes.custom_llm import prewarm_openai_cache
+                import asyncio
+                asyncio.create_task(prewarm_openai_cache(system_content))
+
         # Handle call-ended event
         if call_id and event == "call-ended":
             call = db.query(CallRecord).filter(CallRecord.id == call_id).first()
